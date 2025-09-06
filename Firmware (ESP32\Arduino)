@@ -7,149 +7,530 @@
 #include <Adafruit_Sensor.h>
 #include <LiquidCrystal_I2C.h>
 #include <FastLED.h>
+#include <ArduinoJson.h>
 
+// Configuration
 #define DESK_ID        "D-101"
 #define WIFI_SSID      "CampusWiFi"
-#define WIFI_PASS      "password"
-#define MQTT_HOST      "10.0.0.50"
+#define WIFI_PASS      "MindDesk2025"
+#define MQTT_HOST      "minddesk.campus.local"
 #define MQTT_PORT      1883
+#define FIRMWARE_VER   "1.2.0"
 
-// RFID (SPI)
-#define SS_PIN   5
-#define RST_PIN  4
+// Pin Definitions - Optimized for ESP32 DevKit
+#define SS_PIN         5    // RFID SDA
+#define RST_PIN        4    // RFID Reset
+#define LED_PIN        27   // LED Strip Data
+#define BUZZ_PIN       26   // Piezo Buzzer
+#define VIB_PIN        25   // Vibration Motor
+
+// Hardware Objects
 MFRC522 rfid(SS_PIN, RST_PIN);
-
-// IMU
 Adafruit_MPU6050 mpu;
-
-// LCD (I2C 0x27)
-LiquidCrystal_I2C lcd(0x27, 16, 2);
-
-// LED strip
-#define LED_PIN 27
+LiquidCrystal_I2C lcd(0x27, 16, 2);  // I2C LCD
 #define NUM_LEDS 20
 CRGB leds[NUM_LEDS];
 
-// Buzzer / vib
-#define BUZZ_PIN 26
-#define VIB_PIN  25
-
+// Network & MQTT
 WiFiClient wifiClient;
 PubSubClient mqtt(wifiClient);
 
-bool occupied = false;
-unsigned long lastPublish = 0;
-unsigned long leaveDeadline = 0;  // millis() when leave window ends (0 = none)
-String currentUser = "";
+// State Management
+struct DeskState {
+  bool occupied = false;
+  bool reserved = false;
+  String currentUser = "";
+  String reservedBy = "";
+  unsigned long sessionStart = 0;
+  unsigned long leaveDeadline = 0;
+  unsigned long lastHeartbeat = 0;
+  unsigned long lastPostureCheck = 0;
+  float currentTilt = 0.0;
+  bool buzzerActive = false;
+  bool vibrationActive = false;
+} desk;
 
-void setLED(String color) {
-  fill_solid(leds, NUM_LEDS, (color=="red")?CRGB::Red:(color=="amber")?CRGB::Orange:CRGB::Black);
+// Timing constants
+const unsigned long HEARTBEAT_INTERVAL = 5000;    // 5 seconds
+const unsigned long POSTURE_CHECK_INTERVAL = 2000; // 2 seconds
+const unsigned long LEAVE_WINDOW = 600000;        // 10 minutes
+const unsigned long RFID_COOLDOWN = 2000;         // 2 seconds between scans
+
+// MQTT Topics
+String getTopicPath(String subtopic) {
+  return "minddesk/" + String(DESK_ID) + "/" + subtopic;
+}
+
+// LED Control Functions
+void setLEDColor(String color, int brightness = 255) {
+  CRGB ledColor = CRGB::Black;
+  
+  if (color == "red") ledColor = CRGB::Red;
+  else if (color == "green") ledColor = CRGB::Green;
+  else if (color == "amber" || color == "orange") ledColor = CRGB::Orange;
+  else if (color == "blue") ledColor = CRGB::Blue;
+  else if (color == "purple") ledColor = CRGB::Purple;
+  
+  ledColor.nscale8(brightness);
+  fill_solid(leds, NUM_LEDS, ledColor);
   FastLED.show();
 }
 
-void buzz(int ms) {
+void ledBlink(String color, int times = 3, int interval = 200) {
+  for(int i = 0; i < times; i++) {
+    setLEDColor(color);
+    delay(interval);
+    setLEDColor("off");
+    delay(interval);
+  }
+}
+
+void ledPulse(String color, int duration = 2000) {
+  unsigned long start = millis();
+  while(millis() - start < duration) {
+    int brightness = (sin((millis() - start) * 0.005) + 1) * 127;
+    setLEDColor(color, brightness);
+    delay(10);
+  }
+  setLEDColor("off");
+}
+
+// Audio & Haptic Feedback
+void playBuzzer(int frequency, int duration) {
+  if (desk.buzzerActive) return;
+  desk.buzzerActive = true;
+  
+  ledcSetup(0, frequency, 8);
   ledcAttachPin(BUZZ_PIN, 0);
-  ledcWriteTone(0, 1800);
-  delay(ms);
+  ledcWriteTone(0, frequency);
+  delay(duration);
   ledcWriteTone(0, 0);
+  ledcDetachPin(BUZZ_PIN);
+  
+  desk.buzzerActive = false;
 }
 
-void vibrate(int ms){
-  pinMode(VIB_PIN, OUTPUT);
-  digitalWrite(VIB_PIN, HIGH);
-  delay(ms);
-  digitalWrite(VIB_PIN, LOW);
+void vibrateMotor(int duration, int intensity = 255) {
+  if (desk.vibrationActive) return;
+  desk.vibrationActive = true;
+  
+  ledcSetup(1, 1000, 8);
+  ledcAttachPin(VIB_PIN, 1);
+  ledcWrite(1, intensity);
+  delay(duration);
+  ledcWrite(1, 0);
+  ledcDetachPin(VIB_PIN);
+  
+  desk.vibrationActive = false;
 }
 
-void showLCD(const String& l1, const String& l2="") {
-  lcd.clear(); lcd.setCursor(0,0); lcd.print(l1); lcd.setCursor(0,1); lcd.print(l2);
+// Feedback Patterns
+void feedbackPostureAlert() {
+  vibrateMotor(300, 180);
+  setLEDColor("amber");
+  delay(100);
+  setLEDColor("off");
 }
 
-void ensureWiFi() {
+void feedbackSleepAlert() {
+  playBuzzer(1800, 800);
+  vibrateMotor(1000, 255);
+  ledBlink("red", 5, 150);
+}
+
+void feedbackSecurityAlert() {
+  for(int i = 0; i < 3; i++) {
+    playBuzzer(2000, 400);
+    setLEDColor("red");
+    delay(200);
+    setLEDColor("off");
+    delay(200);
+  }
+  vibrateMotor(1500, 255);
+}
+
+void feedbackSuccess() {
+  playBuzzer(1500, 200);
+  delay(100);
+  playBuzzer(2000, 200);
+  ledPulse("green", 1000);
+}
+
+// LCD Display Management
+void updateDisplay(String line1, String line2 = "") {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(line1.length() > 16 ? line1.substring(0, 16) : line1);
+  
+  if (line2.length() > 0) {
+    lcd.setCursor(0, 1);
+    lcd.print(line2.length() > 16 ? line2.substring(0, 16) : line2);
+  }
+}
+
+void showStatus() {
+  if (desk.occupied) {
+    String line1 = "User: " + desk.currentUser.substring(0, 11);
+    String sessionTime = String((millis() - desk.sessionStart) / 60000) + "min";
+    updateDisplay(line1, "Time: " + sessionTime);
+  } else if (desk.reserved) {
+    updateDisplay("RESERVED", "For: " + desk.reservedBy.substring(0, 12));
+  } else {
+    updateDisplay("MindDesk Ready", "Scan card");
+  }
+}
+
+// Network Management
+void ensureWiFiConnection() {
   if (WiFi.status() == WL_CONNECTED) return;
+  
+  updateDisplay("Connecting WiFi", "Please wait...");
+  setLEDColor("blue");
+  
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  while (WiFi.status() != WL_CONNECTED) { delay(500); }
+  unsigned long timeout = millis() + 30000;
+  
+  while (WiFi.status() != WL_CONNECTED && millis() < timeout) {
+    delay(500);
+    ledBlink("blue", 1, 100);
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    updateDisplay("WiFi Connected", WiFi.localIP().toString());
+    feedbackSuccess();
+    Serial.println("WiFi connected: " + WiFi.localIP().toString());
+  } else {
+    updateDisplay("WiFi Failed", "Check network");
+    setLEDColor("red");
+    Serial.println("WiFi connection failed");
+  }
+  delay(2000);
 }
 
-void onMsg(char* topic, byte* payload, unsigned int len) {
-  String t = String(topic);
-  String msg = "";
-  for (uint i=0;i<len;i++) msg += (char)payload[i];
-
-  if (t.endsWith("/event/posture")) {
-    if (msg.indexOf("slouch")>=0) { setLED("amber"); vibrate(500); }
-    else if (msg.indexOf("sleep")>=0){ setLED("red"); buzz(800); vibrate(800); }
-    else { setLED("off"); }
-  } else if (t.endsWith("/leave_pending")) {
-    // payload like {"deadline": 600000}
-    int pos = msg.indexOf(":");
-    int ms = msg.substring(pos+1).toInt();
-    leaveDeadline = millis() + ms;
-    showLCD("Leave in 10 min", "Timer started");
-  } else if (t.endsWith("/reserve")) {
-    setLED("amber"); showLCD("Reserved", msg);
-  } else if (t.endsWith("/command")) {
-    if (msg.indexOf("red")>=0) setLED("red");
-    else if (msg.indexOf("amber")>=0) setLED("amber");
-    else setLED("off");
-    if (msg.indexOf("buzz")>=0) buzz(400);
+// MQTT Message Handler
+void onMQTTMessage(char* topic, byte* payload, unsigned int length) {
+  String topicStr = String(topic);
+  
+  // Parse JSON payload
+  DynamicJsonDocument doc(1024);
+  deserializeJson(doc, payload, length);
+  
+  Serial.println("MQTT Received: " + topicStr);
+  Serial.println("Payload: " + String((char*)payload));
+  
+  if (topicStr.endsWith("/event/posture")) {
+    String state = doc["state"].as<String>();
+    
+    if (state == "slouch") {
+      updateDisplay("Posture Check", "Sit up straight");
+      feedbackPostureAlert();
+      desk.lastPostureCheck = millis();
+    }
+    else if (state == "sleep") {
+      updateDisplay("Wake Up!", "Stay alert");
+      feedbackSleepAlert();
+    }
+    else if (state == "stranger") {
+      updateDisplay("ACCESS DENIED", "Scan valid card");
+      feedbackSecurityAlert();
+    }
+    else if (state == "ok") {
+      setLEDColor("green");
+      showStatus();
+    }
+  }
+  else if (topicStr.endsWith("/reserve")) {
+    desk.reserved = true;
+    desk.reservedBy = doc["userId"].as<String>();
+    updateDisplay("Reserved", "User: " + desk.reservedBy);
+    setLEDColor("amber");
+    vibrateMotor(200);
+  }
+  else if (topicStr.endsWith("/leave_pending")) {
+    unsigned long timeoutMs = doc["timeout"].as<unsigned long>();
+    desk.leaveDeadline = millis() + timeoutMs;
+    updateDisplay("Leave Window", "10 min to return");
+    setLEDColor("amber");
+    ledBlink("amber", 3);
+  }
+  else if (topicStr.endsWith("/command")) {
+    String cmd = doc["command"].as<String>();
+    if (cmd == "reset") {
+      ESP.restart();
+    }
+    else if (cmd == "test_buzzer") {
+      playBuzzer(2000, 500);
+    }
+    else if (cmd == "test_vibration") {
+      vibrateMotor(500);
+    }
   }
 }
 
-void ensureMQTT() {
+void ensureMQTTConnection() {
   while (!mqtt.connected()) {
-    mqtt.connect(DESK_ID);
-    mqtt.subscribe(("minddesk/"+String(DESK_ID)+"/#").c_str());
+    updateDisplay("Connecting MQTT", "Please wait...");
+    setLEDColor("purple");
+    
+    String clientId = "MindDesk-" + String(DESK_ID) + "-" + String(random(0xffff), HEX);
+    
+    if (mqtt.connect(clientId.c_str())) {
+      Serial.println("MQTT connected");
+      updateDisplay("MQTT Connected", "Subscribing...");
+      
+      // Subscribe to all relevant topics
+      mqtt.subscribe(getTopicPath("+").c_str());
+      mqtt.subscribe(getTopicPath("event/+").c_str());
+      mqtt.subscribe(getTopicPath("command").c_str());
+      
+      // Publish online status
+      publishStatus();
+      feedbackSuccess();
+    } else {
+      Serial.println("MQTT connection failed, rc=" + String(mqtt.state()));
+      updateDisplay("MQTT Failed", "Retrying...");
+      delay(5000);
+    }
   }
 }
 
+// Data Publishing
 void publishStatus() {
-  sensors_event_t a,g,temp;
-  mpu.getEvent(&a,&g,&temp);
-  float tilt = atan2(a.acceleration.y, a.acceleration.z) * 57.2958; // deg
-
-  String payload = "{\"occupied\":"+String(occupied?"true":"false")+
-                   ",\"tilt\":"+String(tilt,1)+
-                   ",\"ts\":"+String(millis())+"}";
-  mqtt.publish(("minddesk/"+String(DESK_ID)+"/status").c_str(), payload.c_str());
+  DynamicJsonDocument doc(512);
+  
+  doc["deskId"] = DESK_ID;
+  doc["occupied"] = desk.occupied;
+  doc["reserved"] = desk.reserved;
+  doc["currentUser"] = desk.currentUser;
+  doc["sessionDuration"] = desk.occupied ? (millis() - desk.sessionStart) / 1000 : 0;
+  doc["tilt"] = desk.currentTilt;
+  doc["rssi"] = WiFi.RSSI();
+  doc["uptime"] = millis() / 1000;
+  doc["firmware"] = FIRMWARE_VER;
+  doc["timestamp"] = millis();
+  
+  String payload;
+  serializeJson(doc, payload);
+  
+  mqtt.publish(getTopicPath("status").c_str(), payload.c_str());
+  desk.lastHeartbeat = millis();
 }
 
+void publishIncident(String type, String details = "") {
+  DynamicJsonDocument doc(256);
+  
+  doc["deskId"] = DESK_ID;
+  doc["type"] = type;
+  doc["details"] = details;
+  doc["user"] = desk.currentUser;
+  doc["timestamp"] = millis();
+  
+  String payload;
+  serializeJson(doc, payload);
+  
+  mqtt.publish(getTopicPath("incident").c_str(), payload.c_str());
+  Serial.println("Incident published: " + type);
+}
+
+// RFID Processing
+String getCardUID() {
+  String uid = "";
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    uid += String(rfid.uid.uidByte[i] < 0x10 ? "0" : "");
+    uid += String(rfid.uid.uidByte[i], HEX);
+  }
+  uid.toUpperCase();
+  return uid;
+}
+
+void processRFID() {
+  static unsigned long lastScan = 0;
+  
+  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) {
+    return;
+  }
+  
+  if (millis() - lastScan < RFID_COOLDOWN) {
+    rfid.PICC_HaltA();
+    return;
+  }
+  
+  String cardUID = getCardUID();
+  Serial.println("RFID Card scanned: " + cardUID);
+  
+  if (!desk.occupied) {
+    // Check-in process
+    desk.occupied = true;
+    desk.currentUser = cardUID;
+    desk.sessionStart = millis();
+    desk.reserved = false;
+    
+    updateDisplay("Checked In", "User: " + cardUID.substring(0, 12));
+    setLEDColor("green");
+    feedbackSuccess();
+    
+    publishStatus();
+    Serial.println("User checked in: " + cardUID);
+  } else {
+    // Check-out process
+    if (desk.currentUser == cardUID) {
+      desk.occupied = false;
+      desk.currentUser = "";
+      desk.leaveDeadline = 0;
+      
+      updateDisplay("Checked Out", "Thank you!");
+      setLEDColor("off");
+      playBuzzer(1200, 300);
+      
+      publishStatus();
+      Serial.println("User checked out: " + cardUID);
+      
+      delay(2000);
+      showStatus();
+    } else {
+      updateDisplay("Wrong Card", "Not authorized");
+      feedbackSecurityAlert();
+      publishIncident("unauthorized_card", "Card: " + cardUID);
+    }
+  }
+  
+  lastScan = millis();
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+}
+
+// Sensor Reading
+void readSensors() {
+  sensors_event_t accel, gyro, temp;
+  if (!mpu.getEvent(&accel, &gyro, &temp)) {
+    return;
+  }
+  
+  // Calculate tilt angle from accelerometer
+  float tiltX = atan2(accel.acceleration.y, accel.acceleration.z) * 57.2958;
+  float tiltY = atan2(-accel.acceleration.x, accel.acceleration.z) * 57.2958;
+  desk.currentTilt = sqrt(tiltX * tiltX + tiltY * tiltY);
+  
+  // Simple posture detection backup (if camera fails)
+  static float lastTilt = 0;
+  static unsigned long stableTiltTime = 0;
+  
+  if (abs(desk.currentTilt - lastTilt) < 2.0) {  // Stable position
+    if (stableTiltTime == 0) stableTiltTime = millis();
+    
+    // If tilted forward significantly for too long
+    if (desk.currentTilt > 25 && millis() - stableTiltTime > 30000) {
+      if (millis() - desk.lastPostureCheck > 60000) {  // Don't spam
+        publishIncident("poor_posture_imu", "Tilt: " + String(desk.currentTilt));
+        feedbackPostureAlert();
+        desk.lastPostureCheck = millis();
+      }
+    }
+  } else {
+    stableTiltTime = 0;
+    lastTilt = desk.currentTilt;
+  }
+}
+
+// Leave Window Management
+void checkLeaveDeadline() {
+  if (desk.leaveDeadline > 0 && millis() > desk.leaveDeadline) {
+    updateDisplay("OVERSTAY ALERT", "Contact staff");
+    setLEDColor("red");
+    feedbackSecurityAlert();
+    
+    publishIncident("overstay", "Exceeded 10min leave window");
+    
+    desk.leaveDeadline = 0;  // Reset to prevent spam
+  }
+}
+
+// Setup Function
 void setup() {
   Serial.begin(115200);
-  pinMode(BUZZ_PIN, OUTPUT); pinMode(VIB_PIN, OUTPUT);
-  FastLED.addLeds<NEOPIXEL, LED_PIN>(leds, NUM_LEDS); setLED("off");
-
-  lcd.init(); lcd.backlight(); showLCD("MindDesk", "Booting...");
-  SPI.begin(); rfid.PCD_Init();
-
-  Wire.begin(); mpu.begin();
-
-  ensureWiFi(); mqtt.setServer(MQTT_HOST, MQTT_PORT); mqtt.setCallback(onMsg);
-  ensureMQTT(); showLCD("Ready", "Scan card");
+  Serial.println("\n=== MindDesk ESP32 Firmware v" + String(FIRMWARE_VER) + " ===");
+  
+  // Initialize hardware pins
+  pinMode(BUZZ_PIN, OUTPUT);
+  pinMode(VIB_PIN, OUTPUT);
+  
+  // Initialize LED strip
+  FastLED.addLeds<WS2812, LED_PIN, GRB>(leds, NUM_LEDS);
+  FastLED.setBrightness(200);
+  setLEDColor("off");
+  
+  // Initialize LCD
+  lcd.init();
+  lcd.backlight();
+  updateDisplay("MindDesk Init", "Loading...");
+  
+  // Initialize SPI for RFID
+  SPI.begin();
+  rfid.PCD_Init();
+  Serial.println("RFID initialized");
+  
+  // Initialize I2C for IMU
+  Wire.begin(21, 22);  // SDA, SCL
+  if (!mpu.begin()) {
+    Serial.println("Failed to find MPU6050 chip");
+    updateDisplay("IMU Error", "Check wiring");
+    setLEDColor("red");
+    while (1) { delay(1000); }
+  }
+  
+  // Configure IMU
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  Serial.println("IMU initialized");
+  
+  // Connect to WiFi
+  ensureWiFiConnection();
+  
+  // Setup MQTT
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setCallback(onMQTTMessage);
+  mqtt.setBufferSize(1024);
+  
+  // Connect to MQTT
+  ensureMQTTConnection();
+  
+  updateDisplay("System Ready", "Scan card to start");
+  setLEDColor("blue", 50);  // Dim blue = ready
+  
+  Serial.println("MindDesk initialization complete");
+  Serial.println("Desk ID: " + String(DESK_ID));
+  Serial.println("WiFi IP: " + WiFi.localIP().toString());
 }
 
+// Main Loop
 void loop() {
-  ensureWiFi(); ensureMQTT(); mqtt.loop();
-
-  // RFID check-in/out
-  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
-    occupied = !occupied; // simple toggle for demo
-    currentUser = occupied ? "user" : "";
-    showLCD(occupied ? "Checked in" : "Checked out");
+  // Maintain connections
+  ensureWiFiConnection();
+  ensureMQTTConnection();
+  mqtt.loop();
+  
+  // Process RFID scans
+  processRFID();
+  
+  // Read sensors
+  readSensors();
+  
+  // Check leave deadline
+  checkLeaveDeadline();
+  
+  // Periodic status updates
+  if (millis() - desk.lastHeartbeat > HEARTBEAT_INTERVAL) {
     publishStatus();
-    delay(800);
   }
-
-  // Leave window enforcement
-  if (leaveDeadline && millis() > leaveDeadline) {
-    mqtt.publish(("minddesk/"+String(DESK_ID)+"/incident").c_str(),
-                 "{\"type\":\"overstay\"}");
-    setLED("red"); buzz(800); vibrate(800);
-    leaveDeadline = 0;
+  
+  // Update display periodically
+  static unsigned long lastDisplayUpdate = 0;
+  if (millis() - lastDisplayUpdate > 10000) {  // Every 10 seconds
+    showStatus();
+    lastDisplayUpdate = millis();
   }
-
-  // periodic telemetry
-  if (millis() - lastPublish > 5000) {
-    publishStatus(); lastPublish = millis();
-  }
+  
+  // Small delay to prevent watchdog issues
+  delay(100);
 }
