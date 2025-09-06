@@ -1,6 +1,13 @@
-MindDesk – Smart Study Desk for Focus, Wellbeing & Efficiency
+📖 Overview  
+**MindDesk** is a **smart study desk system** designed to improve student focus, posture, and library resource management.  
+It combines **sensors, actuators, and IoT connectivity** to create a wellbeing-aware study environment.  
 
-A smart desk that assists in focusing and improve productivity while keeps user in mind of posture.
-A smart desk with occupancy detection and sends data to a livemap for ease of occupancy monitoring.
-A smart desk with customisable ambient lighting to ease the eyes and set the mood.
-A smart desk that possess "Focus mode", which allows user to be focused on tasks.
+- Detects **occupancy** and shows real-time desk availability on a live campus map.  
+- Monitors **posture** (slouching / sleeping) and nudges users via light & vibration feedback.  
+- Prevents **unauthorized use** with RFID authentication and alerts librarians if strangers or overstays occur.  
+- Encourages **healthy focus cycles** (Pomodoro-style reminders).  
+- Provides **analytics dashboards** for facilities to optimize resource planning.
+
+**MindDesk Logo**
+
+<img width="480" height="480" alt="MindDesk Icon" src="https://github.com/user-attachments/assets/d9d49598-2381-475c-8868-c0878cfb40d8" />
