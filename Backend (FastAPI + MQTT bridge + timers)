@@ -1,55 +1,787 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-import paho.mqtt.client as mqtt, json, time, threading
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Any
+import paho.mqtt.client as mqtt
+import json
+import time
+import threading
+import asyncio
+import logging
+from datetime import datetime, timedelta
+from dataclasses import dataclass, asdict
+from contextlib import asynccontextmanager
+import sqlite3
+import bcrypt
+import jwt
+from twilio.rest import Client as TwilioClient
+import smtplib
+from email.mime.text import MimeText
+from email.mime.multipart import MimeMultipart
 
-BROKER="10.0.0.50"
-app = FastAPI(title="MindDesk Service")
+# Configuration
+MQTT_BROKER = "localhost"
+MQTT_PORT = 1883
+JWT_SECRET = "minddesk_hackathon_2025"
+DB_PATH = "minddesk.db"
 
-# in-memory demo store
-RESERVATIONS = {}   # deskId -> {"userId":..., "expires":...}
-LEAVE_TIMER = {}    # deskId -> deadline epoch ms
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-mqttc = mqtt.Client()
+# Data Models
+class DeskReservation(BaseModel):
+    desk_id: str = Field(..., description="Desk identifier")
+    user_id: str = Field(..., description="Student ID")
+    duration_minutes: int = Field(60, ge=15, le=480, description="Reservation duration")
+    start_time: Optional[datetime] = None
 
-def on_message(client, userdata, msg):
-    topic = msg.topic
-    if topic.endswith("/status"):
-        # forward to dashboard via SSE/websocket in a real app
-        pass
-    if topic.endswith("/incident"):
-        data = json.loads(msg.payload.decode())
-        if data.get("type") in ("overstay","security","posture"):
-            print("ALERT:", topic, data)  # hook to SMS/Telegram for librarian
+class LeaveRequest(BaseModel):
+    desk_id: str = Field(..., description="Desk identifier")
+    user_id: str = Field(..., description="Student ID requesting leave")
+    leave_duration_minutes: int = Field(10, ge=5, le=30, description="Leave window duration")
 
-mqttc.on_message = on_message
-mqttc.connect(BROKER, 1883, 60)
-mqttc.subscribe("minddesk/+/status")
-mqttc.subscribe("minddesk/+/incident")
-threading.Thread(target=mqttc.loop_forever, daemon=True).start()
+class UserAuth(BaseModel):
+    student_id: str = Field(..., description="Student ID")
+    password: str = Field(..., description="Password")
 
-class ReserveReq(BaseModel):
-    deskId: str
-    userId: str
-    minutes: int = 60
+class DeskStatus(BaseModel):
+    desk_id: str
+    occupied: bool
+    reserved: bool
+    current_user: Optional[str] = None
+    reserved_by: Optional[str] = None
+    session_duration: int = 0
+    last_seen: datetime
+    posture_score: float = 1.0
+    incidents: List[Dict[str, Any]] = []
+
+# Global state management
+@dataclass
+class DeskState:
+    desk_id: str
+    occupied: bool = False
+    reserved: bool = False
+    current_user: Optional[str] = None
+    reserved_by: Optional[str] = None
+    session_start: Optional[datetime] = None
+    leave_deadline: Optional[datetime] = None
+    last_heartbeat: datetime = None
+    posture_alerts: int = 0
+    total_incidents: int = 0
+    rssi: int = 0
+    tilt: float = 0.0
+
+class MindDeskBackend:
+    def __init__(self):
+        self.desks: Dict[str, DeskState] = {}
+        self.active_reservations: Dict[str, dict] = {}
+        self.leave_timers: Dict[str, datetime] = {}
+        self.incident_log: List[dict] = []
+        
+        # MQTT client
+        self.mqtt_client = mqtt.Client("minddesk_backend")
+        self.mqtt_connected = False
+        
+        # Initialize database
+        self.init_database()
+        
+        # Initialize external services
+        self.setup_alert_services()
+    
+    def init_database(self):
+        """Initialize SQLite database"""
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # Users table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                student_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                email TEXT,
+                phone TEXT,
+                password_hash TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Desks table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS desks (
+                desk_id TEXT PRIMARY KEY,
+                location TEXT NOT NULL,
+                floor INTEGER,
+                features TEXT,
+                status TEXT DEFAULT 'available'
+            )
+        """)
+        
+        # Sessions table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                desk_id TEXT,
+                user_id TEXT,
+                start_time TIMESTAMP,
+                end_time TIMESTAMP,
+                duration_minutes INTEGER,
+                posture_score FLOAT DEFAULT 1.0,
+                incidents INTEGER DEFAULT 0,
+                FOREIGN KEY (desk_id) REFERENCES desks (desk_id),
+                FOREIGN KEY (user_id) REFERENCES users (student_id)
+            )
+        """)
+        
+        # Incidents table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS incidents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                desk_id TEXT,
+                user_id TEXT,
+                incident_type TEXT NOT NULL,
+                details TEXT,
+                severity TEXT DEFAULT 'medium',
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                resolved BOOLEAN DEFAULT FALSE
+            )
+        """)
+        
+        # Insert sample data
+        sample_desks = [
+            ("D-101", "Library Floor 1, Section A", 1, "power,wifi,lamp"),
+            ("D-102", "Library Floor 1, Section A", 1, "power,wifi"),
+            ("D-201", "Library Floor 2, Section B", 2, "power,wifi,lamp,whiteboard"),
+            ("D-202", "Library Floor 2, Section B", 2, "power,wifi"),
+        ]
+        
+        cursor.executemany(
+            "INSERT OR IGNORE INTO desks (desk_id, location, floor, features) VALUES (?, ?, ?, ?)",
+            sample_desks
+        )
+        
+        # Create admin user (password: admin123)
+        admin_hash = bcrypt.hashpw("admin123".encode(), bcrypt.gensalt())
+        cursor.execute(
+            "INSERT OR IGNORE INTO users (student_id, name, email, password_hash) VALUES (?, ?, ?, ?)",
+            ("admin", "System Administrator", "admin@university.edu", admin_hash)
+        )
+        
+        conn.commit()
+        conn.close()
+        logger.info("Database initialized")
+    
+    def setup_alert_services(self):
+        """Setup external alert services (SMS, Email)"""
+        # In production, these would be loaded from environment variables
+        self.twilio_client = None  # TwilioClient(account_sid, auth_token)
+        self.smtp_config = {
+            "server": "smtp.university.edu",
+            "port": 587,
+            "username": "minddesk@university.edu",
+            "password": "email_password"
+        }
+    
+    def setup_mqtt(self):
+        """Setup MQTT client with event handlers"""
+        def on_connect(client, userdata, flags, rc):
+            if rc == 0:
+                self.mqtt_connected = True
+                logger.info("MQTT connected")
+                
+                # Subscribe to all desk topics
+                client.subscribe("minddesk/+/status")
+                client.subscribe("minddesk/+/incident")
+                client.subscribe("minddesk/+/event/+")
+            else:
+                logger.error(f"MQTT connection failed: {rc}")
+        
+        def on_message(client, userdata, msg):
+            try:
+                topic_parts = msg.topic.split("/")
+                desk_id = topic_parts[1]
+                message_type = topic_parts[-1]
+                
+                payload = json.loads(msg.payload.decode())
+                self.handle_mqtt_message(desk_id, message_type, payload)
+            except Exception as e:
+                logger.error(f"Error processing MQTT message: {e}")
+        
+        self.mqtt_client.on_connect = on_connect
+        self.mqtt_client.on_message = on_message
+        
+        try:
+            self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+            self.mqtt_client.loop_start()
+        except Exception as e:
+            logger.error(f"MQTT connection failed: {e}")
+    
+    def handle_mqtt_message(self, desk_id: str, message_type: str, payload: dict):
+        """Handle incoming MQTT messages from desks"""
+        if desk_id not in self.desks:
+            self.desks[desk_id] = DeskState(desk_id=desk_id)
+        
+        desk = self.desks[desk_id]
+        
+        if message_type == "status":
+            # Update desk status
+            desk.occupied = payload.get("occupied", False)
+            desk.current_user = payload.get("currentUser")
+            desk.rssi = payload.get("rssi", 0)
+            desk.tilt = payload.get("tilt", 0.0)
+            desk.last_heartbeat = datetime.now()
+            
+            if desk.occupied and not desk.session_start:
+                desk.session_start = datetime.now()
+            elif not desk.occupied:
+                desk.session_start = None
+            
+            logger.debug(f"Desk {desk_id} status updated: occupied={desk.occupied}")
+        
+        elif message_type == "incident":
+            incident_type = payload.get("type")
+            self.handle_incident(desk_id, incident_type, payload)
+        
+        elif message_type == "posture":
+            state = payload.get("state", "ok")
+            if state in ["slouch", "sleep"]:
+                desk.posture_alerts += 1
+                self.log_incident(desk_id, f"posture_{state}", payload)
+    
+    def handle_incident(self, desk_id: str, incident_type: str, payload: dict):
+        """Handle security and behavioral incidents"""
+        desk = self.desks.get(desk_id)
+        if not desk:
+            return
+        
+        incident = {
+            "desk_id": desk_id,
+            "type": incident_type,
+            "timestamp": datetime.now().isoformat(),
+            "details": payload,
+            "user": desk.current_user
+        }
+        
+        self.incident_log.append(incident)
+        desk.total_incidents += 1
+        
+        # Log to database
+        self.log_incident(desk_id, incident_type, payload)
+        
+        # Trigger appropriate alerts
+        if incident_type in ["overstay", "security", "unauthorized_card"]:
+            self.send_librarian_alert(desk_id, incident_type, payload)
+        
+        logger.warning(f"Incident at desk {desk_id}: {incident_type}")
+    
+    def log_incident(self, desk_id: str, incident_type: str, details: dict):
+        """Log incident to database"""
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            
+            desk = self.desks.get(desk_id)
+            user_id = desk.current_user if desk else None
+            
+            cursor.execute(
+                """INSERT INTO incidents (desk_id, user_id, incident_type, details, severity) 
+                   VALUES (?, ?, ?, ?, ?)""",
+                (desk_id, user_id, incident_type, json.dumps(details), 
+                 "high" if incident_type in ["security", "overstay"] else "medium")
+            )
+            
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Failed to log incident: {e}")
+    
+    def send_librarian_alert(self, desk_id: str, incident_type: str, details: dict):
+        """Send alert to library staff"""
+        message = f"MindDesk Alert - Desk {desk_id}: {incident_type}"
+        
+        if incident_type == "overstay":
+            message += f"\nStudent exceeded leave window by {details.get('duration', 'unknown')} minutes"
+        elif incident_type == "security":
+            message += f"\nUnauthorized access detected"
+        elif incident_type == "unauthorized_card":
+            message += f"\nInvalid card scan attempt"
+        
+        # Send SMS alert (if configured)
+        if self.twilio_client:
+            try:
+                self.twilio_client.messages.create(
+                    body=message,
+                    from_="+1234567890",  # Twilio number
+                    to="+1987654321"      # Librarian number
+                )
+                logger.info(f"SMS alert sent for {incident_type} at {desk_id}")
+            except Exception as e:
+                logger.error(f"Failed to send SMS alert: {e}")
+        
+        # Send email alert
+        self.send_email_alert(message, incident_type, desk_id)
+    
+    def send_email_alert(self, message: str, incident_type: str, desk_id: str):
+        """Send email alert to library staff"""
+        try:
+            msg = MimeMultipart()
+            msg['From'] = self.smtp_config['username']
+            msg['To'] = "librarian@university.edu"
+            msg['Subject'] = f"MindDesk Alert: {incident_type.title()} at {desk_id}"
+            
+            body = f"""
+            MindDesk System Alert
+            
+            Desk: {desk_id}
+            Incident: {incident_type}
+            Timestamp: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+            
+            Details:
+            {message}
+            
+            Please check the MindDesk dashboard for more information.
+            
+            Automated message from MindDesk System
+            """
+            
+            msg.attach(MimeText(body, 'plain'))
+            
+            # In production, actually send the email
+            logger.info(f"Email alert prepared for {incident_type} at {desk_id}")
+        except Exception as e:
+            logger.error(f"Failed to send email alert: {e}")
+    
+    def publish_mqtt(self, topic: str, payload: dict):
+        """Publish message to MQTT broker"""
+        if self.mqtt_connected:
+            try:
+                self.mqtt_client.publish(topic, json.dumps(payload))
+            except Exception as e:
+                logger.error(f"Failed to publish MQTT message: {e}")
+
+# Global backend instance
+backend = MindDeskBackend()
+
+# FastAPI app with lifespan management
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    backend.setup_mqtt()
+    yield
+    # Shutdown
+    if backend.mqtt_connected:
+        backend.mqtt_client.disconnect()
+        backend.mqtt_client.loop_stop()
+
+app = FastAPI(
+    title="MindDesk Backend API",
+    description="Smart desk management system for university libraries",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# CORS middleware for web dashboard
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, specify actual origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Authentication helpers
+def create_jwt_token(user_id: str) -> str:
+    payload = {
+        "user_id": user_id,
+        "exp": datetime.utcnow() + timedelta(hours=24)
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+def verify_jwt_token(token: str) -> Optional[str]:
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        return payload.get("user_id")
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
+
+# API Endpoints
+
+@app.post("/auth/login")
+async def login(auth: UserAuth):
+    """Authenticate student and return JWT token"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            "SELECT student_id, password_hash FROM users WHERE student_id = ?",
+            (auth.student_id,)
+        )
+        user = cursor.fetchone()
+        conn.close()
+        
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        
+        if bcrypt.checkpw(auth.password.encode(), user[1]):
+            token = create_jwt_token(auth.student_id)
+            return {"token": token, "user_id": auth.student_id}
+        else:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+            
+    except Exception as e:
+        logger.error(f"Login error: {e}")
+        raise HTTPException(status_code=500, detail="Authentication failed")
+
+@app.get("/desks/available")
+async def get_available_desks():
+    """Get list of available desks with real-time status"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT desk_id, location, floor, features FROM desks")
+        db_desks = cursor.fetchall()
+        conn.close()
+        
+        available_desks = []
+        
+        for desk_id, location, floor, features in db_desks:
+            desk_state = backend.desks.get(desk_id, DeskState(desk_id=desk_id))
+            
+            available_desks.append({
+                "desk_id": desk_id,
+                "location": location,
+                "floor": floor,
+                "features": features.split(",") if features else [],
+                "status": "occupied" if desk_state.occupied else "reserved" if desk_state.reserved else "available",
+                "current_user": desk_state.current_user,
+                "session_duration": int((datetime.now() - desk_state.session_start).total_seconds() / 60) if desk_state.session_start else 0,
+                "last_seen": desk_state.last_heartbeat.isoformat() if desk_state.last_heartbeat else None,
+                "signal_strength": desk_state.rssi
+            })
+        
+        return {"desks": available_desks, "timestamp": datetime.now().isoformat()}
+        
+    except Exception as e:
+        logger.error(f"Error fetching available desks: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch desk data")
 
 @app.post("/reserve")
-def reserve(r: ReserveReq):
-    RESERVATIONS[r.deskId] = {"userId": r.userId, "expires": time.time()+r.minutes*60}
-    mqttc.publish(f"minddesk/{r.deskId}/reserve", json.dumps(RESERVATIONS[r.deskId]))
-    return {"ok": True}
-class LeaveReq(BaseModel):
-    deskId: str
-    minutes: int = 10
+async def reserve_desk(reservation: DeskReservation):
+    """Reserve a desk for a student"""
+    desk_id = reservation.desk_id
+    user_id = reservation.user_id
+    
+    # Check if desk exists and is available
+    if desk_id in backend.desks and backend.desks[desk_id].occupied:
+        raise HTTPException(status_code=400, detail="Desk is currently occupied")
+    
+    if desk_id in backend.active_reservations:
+        raise HTTPException(status_code=400, detail="Desk is already reserved")
+    
+    # Create reservation
+    reservation_data = {
+        "user_id": user_id,
+        "start_time": datetime.now().isoformat(),
+        "duration_minutes": reservation.duration_minutes,
+        "expires_at": (datetime.now() + timedelta(minutes=reservation.duration_minutes)).isoformat()
+    }
+    
+    backend.active_reservations[desk_id] = reservation_data
+    
+    # Update desk state
+    if desk_id not in backend.desks:
+        backend.desks[desk_id] = DeskState(desk_id=desk_id)
+    
+    backend.desks[desk_id].reserved = True
+    backend.desks[desk_id].reserved_by = user_id
+    
+    # Notify desk via MQTT
+    backend.publish_mqtt(f"minddesk/{desk_id}/reserve", {
+        "userId": user_id,
+        "duration": reservation.duration_minutes,
+        "expires": reservation_data["expires_at"]
+    })
+    
+    logger.info(f"Desk {desk_id} reserved by {user_id} for {reservation.duration_minutes} minutes")
+    
+    return {
+        "success": True,
+        "desk_id": desk_id,
+        "reservation": reservation_data
+    }
+
+@app.post("/checkin")
+async def checkin_desk(desk_id: str, user_id: str):
+    """Handle RFID check-in (can be called by mobile app too)"""
+    if desk_id not in backend.desks:
+        backend.desks[desk_id] = DeskState(desk_id=desk_id)
+    
+    desk = backend.desks[desk_id]
+    
+    if desk.occupied:
+        raise HTTPException(status_code=400, detail="Desk is already occupied")
+    
+    # Check reservation
+    reservation = backend.active_reservations.get(desk_id)
+    if reservation and reservation["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Desk reserved for another user")
+    
+    # Check-in user
+    desk.occupied = True
+    desk.current_user = user_id
+    desk.session_start = datetime.now()
+    desk.reserved = False
+    
+    # Clear reservation
+    if desk_id in backend.active_reservations:
+        del backend.active_reservations[desk_id]
+    
+    # Log session start
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO sessions (desk_id, user_id, start_time) VALUES (?, ?, ?)",
+            (desk_id, user_id, datetime.now())
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed to log session start: {e}")
+    
+    logger.info(f"User {user_id} checked into desk {desk_id}")
+    
+    return {"success": True, "message": f"Checked into desk {desk_id}"}
 
 @app.post("/leave")
-def leave(req: LeaveReq):
-    deadline = int((time.time()+req.minutes*60)*1000)
-    LEAVE_TIMER[req.deskId] = deadline
-    mqttc.publish(f"minddesk/{req.deskId}/leave_pending", json.dumps({"deadline": req.minutes*60*1000}))
-    # background watcher
-    def watcher():
-        time.sleep(req.minutes*60)
-        if LEAVE_TIMER.get(req.deskId) == deadline:
-            mqttc.publish(f"minddesk/{req.deskId}/incident", json.dumps({"type":"overstay","ts":int(time.time()*1000)}))
-    threading.Thread(target=watcher, daemon=True).start()
-    return {"ok": True, "deadline": deadline}
+async def request_leave(leave_req: LeaveRequest):
+    """Request temporary leave from desk"""
+    desk_id = leave_req.desk_id
+    user_id = leave_req.user_id
+    
+    if desk_id not in backend.desks:
+        raise HTTPException(status_code=404, detail="Desk not found")
+    
+    desk = backend.desks[desk_id]
+    
+    if not desk.occupied:
+        raise HTTPException(status_code=400, detail="Desk is not occupied")
+    
+    if desk.current_user != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized for this desk")
+    
+    # Set leave deadline
+    leave_deadline = datetime.now() + timedelta(minutes=leave_req.leave_duration_minutes)
+    desk.leave_deadline = leave_deadline
+    backend.leave_timers[desk_id] = leave_deadline
+    
+    # Notify desk hardware
+    backend.publish_mqtt(f"minddesk/{desk_id}/leave_pending", {
+        "timeout": leave_req.leave_duration_minutes * 60 * 1000,  # milliseconds
+        "deadline": leave_deadline.isoformat(),
+        "user_id": user_id
+    })
+    
+    # Start background timer
+    async def leave_timer():
+        await asyncio.sleep(leave_req.leave_duration_minutes * 60)
+        if desk_id in backend.leave_timers and backend.leave_timers[desk_id] == leave_deadline:
+            # User didn't return in time
+            backend.handle_incident(desk_id, "overstay", {
+                "user_id": user_id,
+                "leave_duration": leave_req.leave_duration_minutes,
+                "overstay_duration": 0
+            })
+            
+            # Reset desk state
+            desk.occupied = False
+            desk.current_user = None
+            desk.leave_deadline = None
+            
+            if desk_id in backend.leave_timers:
+                del backend.leave_timers[desk_id]
+    
+    # Run timer in background
+    asyncio.create_task(leave_timer())
+    
+    logger.info(f"Leave request for desk {desk_id} by {user_id}, {leave_req.leave_duration_minutes} minutes")
+    
+    return {
+        "success": True,
+        "leave_deadline": leave_deadline.isoformat(),
+        "message": f"Leave granted for {leave_req.leave_duration_minutes} minutes"
+    }
+
+@app.post("/checkout")
+async def checkout_desk(desk_id: str, user_id: str):
+    """Check out from desk"""
+    if desk_id not in backend.desks:
+        raise HTTPException(status_code=404, detail="Desk not found")
+    
+    desk = backend.desks[desk_id]
+    
+    if not desk.occupied:
+        raise HTTPException(status_code=400, detail="Desk is not occupied")
+    
+    if desk.current_user != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized for this desk")
+    
+    # Calculate session duration
+    session_duration = 0
+    if desk.session_start:
+        session_duration = int((datetime.now() - desk.session_start).total_seconds() / 60)
+    
+    # Update session in database
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            """UPDATE sessions SET end_time = ?, duration_minutes = ?, 
+               incidents = ? WHERE desk_id = ? AND user_id = ? AND end_time IS NULL""",
+            (datetime.now(), session_duration, desk.total_incidents, desk_id, user_id)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed to update session: {e}")
+    
+    # Reset desk state
+    desk.occupied = False
+    desk.current_user = None
+    desk.session_start = None
+    desk.leave_deadline = None
+    desk.posture_alerts = 0
+    desk.total_incidents = 0
+    
+    # Clear any leave timers
+    if desk_id in backend.leave_timers:
+        del backend.leave_timers[desk_id]
+    
+    logger.info(f"User {user_id} checked out from desk {desk_id} after {session_duration} minutes")
+    
+    return {
+        "success": True,
+        "session_duration": session_duration,
+        "message": f"Checked out from desk {desk_id}"
+    }
+
+@app.get("/desk/{desk_id}/status")
+async def get_desk_status(desk_id: str):
+    """Get detailed status for a specific desk"""
+    if desk_id not in backend.desks:
+        raise HTTPException(status_code=404, detail="Desk not found")
+    
+    desk = backend.desks[desk_id]
+    
+    return {
+        "desk_id": desk_id,
+        "occupied": desk.occupied,
+        "reserved": desk.reserved,
+        "current_user": desk.current_user,
+        "reserved_by": desk.reserved_by,
+        "session_duration": int((datetime.now() - desk.session_start).total_seconds() / 60) if desk.session_start else 0,
+        "leave_deadline": desk.leave_deadline.isoformat() if desk.leave_deadline else None,
+        "last_heartbeat": desk.last_heartbeat.isoformat() if desk.last_heartbeat else None,
+        "posture_alerts": desk.posture_alerts,
+        "total_incidents": desk.total_incidents,
+        "signal_strength": desk.rssi,
+        "tilt_angle": desk.tilt
+    }
+
+@app.get("/dashboard/realtime")
+async def get_realtime_dashboard():
+    """Get real-time dashboard data for library staff"""
+    dashboard_data = {
+        "timestamp": datetime.now().isoformat(),
+        "summary": {
+            "total_desks": len(backend.desks),
+            "occupied_desks": len([d for d in backend.desks.values() if d.occupied]),
+            "reserved_desks": len([d for d in backend.desks.values() if d.reserved]),
+            "active_incidents": len([i for i in backend.incident_log if datetime.fromisoformat(i["timestamp"]) > datetime.now() - timedelta(hours=1)])
+        },
+        "desks": [],
+        "recent_incidents": backend.incident_log[-10:]  # Last 10 incidents
+    }
+    
+    for desk_id, desk in backend.desks.items():
+        desk_info = {
+            "desk_id": desk_id,
+            "status": "occupied" if desk.occupied else "reserved" if desk.reserved else "available",
+            "current_user": desk.current_user,
+            "session_duration": int((datetime.now() - desk.session_start).total_seconds() / 60) if desk.session_start else 0,
+            "posture_alerts": desk.posture_alerts,
+            "incidents": desk.total_incidents,
+            "signal_strength": desk.rssi,
+            "last_seen": desk.last_heartbeat.isoformat() if desk.last_heartbeat else None
+        }
+        dashboard_data["desks"].append(desk_info)
+    
+    return dashboard_data
+
+@app.get("/reports/usage")
+async def get_usage_report(start_date: str, end_date: str):
+    """Generate usage analytics report"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            """SELECT desk_id, COUNT(*) as sessions, 
+               AVG(duration_minutes) as avg_duration,
+               SUM(duration_minutes) as total_minutes,
+               AVG(incidents) as avg_incidents
+               FROM sessions 
+               WHERE start_time BETWEEN ? AND ?
+               GROUP BY desk_id""",
+            (start_date, end_date)
+        )
+        
+        usage_data = []
+        for row in cursor.fetchall():
+            usage_data.append({
+                "desk_id": row[0],
+                "total_sessions": row[1],
+                "avg_session_duration": round(row[2], 1) if row[2] else 0,
+                "total_usage_minutes": row[3] if row[3] else 0,
+                "avg_incidents_per_session": round(row[4], 2) if row[4] else 0
+            })
+        
+        conn.close()
+        
+        return {
+            "report_period": {"start": start_date, "end": end_date},
+            "usage_data": usage_data,
+            "generated_at": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Error generating usage report: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate report")
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "mqtt_connected": backend.mqtt_connected,
+        "active_desks": len(backend.desks),
+        "active_reservations": len(backend.active_reservations),
+        "timestamp": datetime.now().isoformat()
+    }
+
+# WebSocket endpoint for real-time updates (optional)
+@app.get("/ws/dashboard")
+async def websocket_dashboard():
+    """WebSocket endpoint for real-time dashboard updates"""
+    # This would implement WebSocket for live updates
+    # For simplicity, we'll use HTTP polling in the frontend
+    return {"message": "WebSocket endpoint - implement as needed"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
