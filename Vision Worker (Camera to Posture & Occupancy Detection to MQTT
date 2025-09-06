@@ -1,0 +1,45 @@
+import cv2, time, json, paho.mqtt.client as mqtt
+import mediapipe as mp
+
+DESK_ID = "D-101"
+BROKER  = "10.0.0.50"
+CAM_IDX = 0
+
+mp_pose = mp.solutions.pose
+pose = mp_pose.Pose(enable_segmentation=False)
+
+cli = mqtt.Client()
+cli.connect(BROKER, 1883, 60)
+
+cap = cv2.VideoCapture(CAM_IDX)
+last_state = "ok"
+last_seen = time.time()
+
+def classify(landmarks):
+    # Very lightweight posture heuristic:
+    # if nose below shoulders (y), and head angle > threshold → "slouch"
+    # if eyes closed proxy (face box still, head very low for > N sec) → "sleep"
+    lms = {lm.name: landmarks[mp_pose.PoseLandmark[lm.name].value] for lm in mp_pose.PoseLandmark}
+    nose = lms["NOSE"] ; l_sh = lms["LEFT_SHOULDER"]; r_sh = lms["RIGHT_SHOULDER"]
+    shoulder_y = (l_sh.y + r_sh.y)/2
+    if nose.y > shoulder_y + 0.1: return "slouch"
+    return "ok"
+
+while True:
+    ok, frame = cap.read()
+    if not ok: time.sleep(0.1); continue
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    res = pose.process(rgb)
+    state = "ok"
+    if res.pose_landmarks:
+        state = classify(res.pose_landmarks.landmark)
+        last_seen = time.time()
+    else:
+        # if someone is present by motion but no pose for long -> 'stranger' or empty
+        if time.time() - last_seen > 5:
+            state = "stranger"
+
+    if state != last_state:
+        payload = json.dumps({"state": state, "ts": int(time.time()*1000)})
+        cli.publish(f"minddesk/{DESK_ID}/event/posture", payload)
+        last_state = state
