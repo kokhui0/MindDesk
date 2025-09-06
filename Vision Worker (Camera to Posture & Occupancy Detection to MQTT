@@ -1,45 +1,447 @@
-import cv2, time, json, paho.mqtt.client as mqtt
+import cv2
+import numpy as np
 import mediapipe as mp
+import paho.mqtt.client as mqtt
+import json
+import time
+import threading
+import logging
+from datetime import datetime
+from collections import deque
+import argparse
 
-DESK_ID = "D-101"
-BROKER  = "10.0.0.50"
-CAM_IDX = 0
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-mp_pose = mp.solutions.pose
-pose = mp_pose.Pose(enable_segmentation=False)
+class MindDeskVisionWorker:
+    def __init__(self, desk_id="D-101", camera_index=0, mqtt_host="minddesk.campus.local"):
+        self.desk_id = desk_id
+        self.camera_index = camera_index
+        self.mqtt_host = mqtt_host
+        
+        # MediaPipe setup
+        self.mp_pose = mp.solutions.pose
+        self.mp_face = mp.solutions.face_detection
+        self.mp_hands = mp.solutions.hands
+        
+        self.pose = self.mp_pose.Pose(
+            static_image_mode=False,
+            model_complexity=1,
+            enable_segmentation=False,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        
+        self.face_detection = self.mp_face.FaceDetection(
+            model_selection=0,
+            min_detection_confidence=0.5
+        )
+        
+        self.hands = self.mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=2,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        
+        # State tracking
+        self.current_state = "empty"
+        self.previous_state = "empty"
+        self.state_start_time = time.time()
+        self.confidence_scores = deque(maxlen=10)  # Rolling confidence window
+        
+        # Posture analysis parameters
+        self.slouch_threshold = 0.15  # Shoulder-nose vertical distance threshold
+        self.sleep_threshold_time = 5.0  # Seconds of inactivity to detect sleep
+        self.state_change_threshold = 3  # Frames to confirm state change
+        self.movement_history = deque(maxlen=30)  # 1 second at 30fps
+        
+        # Privacy protection - no frame storage
+        self.frame_buffer = None
+        self.last_motion_time = time.time()
+        
+        # MQTT setup
+        self.mqtt_client = mqtt.Client(f"vision_worker_{desk_id}")
+        self.mqtt_connected = False
+        
+        # Camera setup
+        self.cap = None
+        self.camera_active = False
+        
+        logger.info(f"MindDesk Vision Worker initialized for desk {desk_id}")
+    
+    def setup_mqtt(self):
+        """Initialize MQTT connection with reconnection logic"""
+        def on_connect(client, userdata, flags, rc):
+            if rc == 0:
+                self.mqtt_connected = True
+                logger.info("MQTT connected successfully")
+                # Subscribe to control commands
+                client.subscribe(f"minddesk/{self.desk_id}/vision/control")
+            else:
+                logger.error(f"MQTT connection failed with code {rc}")
+        
+        def on_disconnect(client, userdata, rc):
+            self.mqtt_connected = False
+            logger.warning("MQTT disconnected")
+        
+        def on_message(client, userdata, msg):
+            try:
+                topic = msg.topic
+                payload = json.loads(msg.payload.decode())
+                self.handle_mqtt_command(topic, payload)
+            except Exception as e:
+                logger.error(f"Error processing MQTT message: {e}")
+        
+        self.mqtt_client.on_connect = on_connect
+        self.mqtt_client.on_disconnect = on_disconnect
+        self.mqtt_client.on_message = on_message
+        
+        try:
+            self.mqtt_client.connect(self.mqtt_host, 1883, 60)
+            self.mqtt_client.loop_start()
+        except Exception as e:
+            logger.error(f"Failed to connect to MQTT broker: {e}")
+    
+    def handle_mqtt_command(self, topic, payload):
+        """Handle incoming MQTT commands"""
+        if topic.endswith("/control"):
+            command = payload.get("command")
+            if command == "calibrate":
+                logger.info("Calibration command received")
+            elif command == "reset":
+                self.reset_state()
+            elif command == "sensitivity":
+                self.adjust_sensitivity(payload.get("level", "medium"))
+    
+    def setup_camera(self):
+        """Initialize camera with error handling"""
+        try:
+            self.cap = cv2.VideoCapture(self.camera_index)
+            if not self.cap.isOpened():
+                raise Exception(f"Cannot open camera {self.camera_index}")
+            
+            # Set camera properties for better performance
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            self.cap.set(cv2.CAP_PROP_FPS, 30)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize latency
+            
+            self.camera_active = True
+            logger.info("Camera initialized successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Camera initialization failed: {e}")
+            return False
+    
+    def analyze_posture(self, landmarks):
+        """Analyze posture from MediaPipe landmarks"""
+        if not landmarks:
+            return "no_person", 0.0
+        
+        try:
+            # Get key landmarks
+            nose = landmarks[self.mp_pose.PoseLandmark.NOSE.value]
+            left_shoulder = landmarks[self.mp_pose.PoseLandmark.LEFT_SHOULDER.value]
+            right_shoulder = landmarks[self.mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
+            left_ear = landmarks[self.mp_pose.PoseLandmark.LEFT_EAR.value]
+            right_ear = landmarks[self.mp_pose.PoseLandmark.RIGHT_EAR.value]
+            
+            # Calculate shoulder midpoint
+            shoulder_mid_y = (left_shoulder.y + right_shoulder.y) / 2
+            shoulder_mid_x = (left_shoulder.x + right_shoulder.x) / 2
+            
+            # Calculate head position relative to shoulders
+            head_forward = nose.y - shoulder_mid_y
+            head_tilt = abs(left_ear.y - right_ear.y)
+            
+            # Detect slouching (head forward of shoulders)
+            if head_forward > self.slouch_threshold:
+                confidence = min(1.0, head_forward / 0.3)  # Normalize confidence
+                return "slouch", confidence
+            
+            # Detect extreme forward lean (potential sleeping)
+            if head_forward > 0.25 and head_tilt > 0.1:
+                confidence = min(1.0, (head_forward + head_tilt) / 0.4)
+                return "sleep_posture", confidence
+            
+            # Good posture
+            return "good_posture", 0.8
+            
+        except (IndexError, AttributeError) as e:
+            logger.debug(f"Posture analysis error: {e}")
+            return "unknown", 0.0
+    
+    def detect_motion(self, frame):
+        """Detect motion to identify activity level"""
+        if self.frame_buffer is None:
+            self.frame_buffer = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            return 0.0
+        
+        # Convert current frame to grayscale
+        current_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Calculate frame difference
+        diff = cv2.absdiff(self.frame_buffer, current_gray)
+        motion_score = np.mean(diff) / 255.0
+        
+        # Update buffer (privacy: only keep one previous frame)
+        self.frame_buffer = current_gray
+        
+        return motion_score
+    
+    def analyze_attention(self, face_landmarks, hand_landmarks):
+        """Analyze attention level based on face and hand positions"""
+        attention_score = 0.5  # Default neutral
+        
+        # Face direction analysis
+        if face_landmarks:
+            # Simple attention heuristic based on face detection confidence
+            attention_score += 0.3
+        
+        # Hand gesture analysis (typing, writing, phone usage)
+        if hand_landmarks:
+            for hand in hand_landmarks:
+                if hand.landmark:
+                    # Simple heuristic: hands near face might indicate phone usage
+                    hand_y = np.mean([lm.y for lm in hand.landmark])
+                    if hand_y < 0.3:  # Hands in upper portion of frame
+                        attention_score -= 0.2  # Potentially distracted
+                    else:
+                        attention_score += 0.1  # Hands in work position
+        
+        return max(0.0, min(1.0, attention_score))
+    
+    def classify_state(self, frame):
+        """Main classification logic"""
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Run MediaPipe inference
+        pose_results = self.pose.process(rgb_frame)
+        face_results = self.face_detection.process(rgb_frame)
+        hand_results = self.hands.process(rgb_frame)
+        
+        # Motion detection
+        motion_score = self.detect_motion(frame)
+        self.movement_history.append(motion_score)
+        avg_motion = np.mean(list(self.movement_history))
+        
+        # Occupancy detection
+        person_detected = pose_results.pose_landmarks is not None
+        
+        if not person_detected:
+            return "empty", 1.0, {}
+        
+        # Analyze posture
+        posture_state, posture_confidence = self.analyze_posture(
+            pose_results.pose_landmarks.landmark if pose_results.pose_landmarks else None
+        )
+        
+        # Analyze attention
+        attention_score = self.analyze_attention(
+            face_results.detections if face_results.detections else None,
+            hand_results.multi_hand_landmarks if hand_results.multi_hand_landmarks else None
+        )
+        
+        # Sleep detection based on low motion + poor posture
+        if avg_motion < 0.02 and posture_state in ["sleep_posture", "slouch"]:
+            time_in_state = time.time() - self.state_start_time
+            if time_in_state > self.sleep_threshold_time:
+                return "sleep", 0.9, {
+                    "motion_score": avg_motion,
+                    "posture_confidence": posture_confidence,
+                    "attention_score": attention_score,
+                    "duration": time_in_state
+                }
+        
+        # Return posture-based state
+        state_map = {
+            "good_posture": "occupied",
+            "slouch": "slouch",
+            "sleep_posture": "sleep",
+            "unknown": "occupied"
+        }
+        
+        final_state = state_map.get(posture_state, "occupied")
+        
+        metadata = {
+            "motion_score": avg_motion,
+            "posture_confidence": posture_confidence,
+            "attention_score": attention_score,
+            "raw_posture": posture_state
+        }
+        
+        return final_state, posture_confidence, metadata
+    
+    def publish_state(self, state, confidence, metadata):
+        """Publish state to MQTT with privacy protection"""
+        if not self.mqtt_connected:
+            return
+        
+        # Privacy-first: only send state, no images or detailed biometrics
+        message = {
+            "desk_id": self.desk_id,
+            "state": state,
+            "confidence": confidence,
+            "timestamp": int(time.time() * 1000),
+            "privacy_mode": True,  # Indicates no personal data stored
+            "metadata": {
+                "motion_level": metadata.get("motion_score", 0),
+                "attention_level": metadata.get("attention_score", 0.5),
+                "analysis_duration_ms": int((time.time() - self.state_start_time) * 1000)
+            }
+        }
+        
+        # Publish to appropriate topics
+        topic = f"minddesk/{self.desk_id}/event/posture"
+        
+        try:
+            self.mqtt_client.publish(topic, json.dumps(message))
+            logger.debug(f"Published state: {state} (confidence: {confidence:.2f})")
+        except Exception as e:
+            logger.error(f"Failed to publish MQTT message: {e}")
+    
+    def reset_state(self):
+        """Reset internal state tracking"""
+        self.current_state = "empty"
+        self.previous_state = "empty"
+        self.state_start_time = time.time()
+        self.confidence_scores.clear()
+        self.movement_history.clear()
+        logger.info("State tracking reset")
+    
+    def adjust_sensitivity(self, level):
+        """Adjust detection sensitivity"""
+        sensitivity_map = {
+            "low": {"slouch": 0.20, "sleep_time": 8.0},
+            "medium": {"slouch": 0.15, "sleep_time": 5.0},
+            "high": {"slouch": 0.10, "sleep_time": 3.0}
+        }
+        
+        if level in sensitivity_map:
+            self.slouch_threshold = sensitivity_map[level]["slouch"]
+            self.sleep_threshold_time = sensitivity_map[level]["sleep_time"]
+            logger.info(f"Sensitivity adjusted to {level}")
+    
+    def process_frame(self):
+        """Process a single frame"""
+        if not self.camera_active:
+            return False
+        
+        ret, frame = self.cap.read()
+        if not ret:
+            logger.warning("Failed to read camera frame")
+            return False
+        
+        # Classify current state
+        state, confidence, metadata = self.classify_state(frame)
+        
+        # State change detection with confidence smoothing
+        self.confidence_scores.append(confidence)
+        avg_confidence = np.mean(list(self.confidence_scores))
+        
+        # Only change state if confident and different from current
+        if state != self.current_state and avg_confidence > 0.7:
+            logger.info(f"State change: {self.current_state} -> {state} (confidence: {avg_confidence:.2f})")
+            self.previous_state = self.current_state
+            self.current_state = state
+            self.state_start_time = time.time()
+            
+            # Publish state change
+            self.publish_state(state, avg_confidence, metadata)
+        
+        # Periodic updates for current state
+        elif time.time() - self.state_start_time > 10:  # Every 10 seconds
+            self.publish_state(self.current_state, avg_confidence, metadata)
+            
+        return True
+    
+    def run(self):
+        """Main processing loop"""
+        logger.info("Starting MindDesk Vision Worker")
+        
+        # Initialize components
+        if not self.setup_camera():
+            logger.error("Camera setup failed, exiting")
+            return
+        
+        self.setup_mqtt()
+        
+        # Wait for MQTT connection
+        retry_count = 0
+        while not self.mqtt_connected and retry_count < 10:
+            logger.info("Waiting for MQTT connection...")
+            time.sleep(1)
+            retry_count += 1
+        
+        if not self.mqtt_connected:
+            logger.error("MQTT connection failed, continuing without MQTT")
+        
+        logger.info("Vision processing started")
+        
+        try:
+            frame_count = 0
+            start_time = time.time()
+            
+            while True:
+                if not self.process_frame():
+                    logger.warning("Frame processing failed, retrying...")
+                    time.sleep(0.1)
+                    continue
+                
+                frame_count += 1
+                
+                # Performance monitoring
+                if frame_count % 300 == 0:  # Every 10 seconds at 30fps
+                    elapsed = time.time() - start_time
+                    fps = frame_count / elapsed
+                    logger.info(f"Processing at {fps:.1f} FPS, Current state: {self.current_state}")
+                
+                # Small delay to prevent excessive CPU usage
+                time.sleep(0.033)  # ~30 FPS
+                
+        except KeyboardInterrupt:
+            logger.info("Shutdown signal received")
+        except Exception as e:
+            logger.error(f"Unexpected error in main loop: {e}")
+        finally:
+            self.cleanup()
+    
+    def cleanup(self):
+        """Cleanup resources"""
+        logger.info("Cleaning up resources...")
+        
+        if self.cap:
+            self.cap.release()
+        
+        if self.mqtt_connected:
+            self.mqtt_client.disconnect()
+            self.mqtt_client.loop_stop()
+        
+        cv2.destroyAllWindows()
+        logger.info("Cleanup complete")
 
-cli = mqtt.Client()
-cli.connect(BROKER, 1883, 60)
+def main():
+    parser = argparse.ArgumentParser(description='MindDesk Vision Worker')
+    parser.add_argument('--desk-id', default='D-101', help='Desk identifier')
+    parser.add_argument('--camera', type=int, default=0, help='Camera index')
+    parser.add_argument('--mqtt-host', default='minddesk.campus.local', help='MQTT broker host')
+    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
+    
+    args = parser.parse_args()
+    
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
+    # Create and run vision worker
+    worker = MindDeskVisionWorker(
+        desk_id=args.desk_id,
+        camera_index=args.camera,
+        mqtt_host=args.mqtt_host
+    )
+    
+    worker.run()
 
-cap = cv2.VideoCapture(CAM_IDX)
-last_state = "ok"
-last_seen = time.time()
-
-def classify(landmarks):
-    # Very lightweight posture heuristic:
-    # if nose below shoulders (y), and head angle > threshold → "slouch"
-    # if eyes closed proxy (face box still, head very low for > N sec) → "sleep"
-    lms = {lm.name: landmarks[mp_pose.PoseLandmark[lm.name].value] for lm in mp_pose.PoseLandmark}
-    nose = lms["NOSE"] ; l_sh = lms["LEFT_SHOULDER"]; r_sh = lms["RIGHT_SHOULDER"]
-    shoulder_y = (l_sh.y + r_sh.y)/2
-    if nose.y > shoulder_y + 0.1: return "slouch"
-    return "ok"
-
-while True:
-    ok, frame = cap.read()
-    if not ok: time.sleep(0.1); continue
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    res = pose.process(rgb)
-    state = "ok"
-    if res.pose_landmarks:
-        state = classify(res.pose_landmarks.landmark)
-        last_seen = time.time()
-    else:
-        # if someone is present by motion but no pose for long -> 'stranger' or empty
-        if time.time() - last_seen > 5:
-            state = "stranger"
-
-    if state != last_state:
-        payload = json.dumps({"state": state, "ts": int(time.time()*1000)})
-        cli.publish(f"minddesk/{DESK_ID}/event/posture", payload)
-        last_state = state
+if __name__ == "__main__":
+    main()
