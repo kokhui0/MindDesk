@@ -1,0 +1,55 @@
+from fastapi import FastAPI
+from pydantic import BaseModel
+import paho.mqtt.client as mqtt, json, time, threading
+
+BROKER="10.0.0.50"
+app = FastAPI(title="MindDesk Service")
+
+# in-memory demo store
+RESERVATIONS = {}   # deskId -> {"userId":..., "expires":...}
+LEAVE_TIMER = {}    # deskId -> deadline epoch ms
+
+mqttc = mqtt.Client()
+
+def on_message(client, userdata, msg):
+    topic = msg.topic
+    if topic.endswith("/status"):
+        # forward to dashboard via SSE/websocket in a real app
+        pass
+    if topic.endswith("/incident"):
+        data = json.loads(msg.payload.decode())
+        if data.get("type") in ("overstay","security","posture"):
+            print("ALERT:", topic, data)  # hook to SMS/Telegram for librarian
+
+mqttc.on_message = on_message
+mqttc.connect(BROKER, 1883, 60)
+mqttc.subscribe("minddesk/+/status")
+mqttc.subscribe("minddesk/+/incident")
+threading.Thread(target=mqttc.loop_forever, daemon=True).start()
+
+class ReserveReq(BaseModel):
+    deskId: str
+    userId: str
+    minutes: int = 60
+
+@app.post("/reserve")
+def reserve(r: ReserveReq):
+    RESERVATIONS[r.deskId] = {"userId": r.userId, "expires": time.time()+r.minutes*60}
+    mqttc.publish(f"minddesk/{r.deskId}/reserve", json.dumps(RESERVATIONS[r.deskId]))
+    return {"ok": True}
+class LeaveReq(BaseModel):
+    deskId: str
+    minutes: int = 10
+
+@app.post("/leave")
+def leave(req: LeaveReq):
+    deadline = int((time.time()+req.minutes*60)*1000)
+    LEAVE_TIMER[req.deskId] = deadline
+    mqttc.publish(f"minddesk/{req.deskId}/leave_pending", json.dumps({"deadline": req.minutes*60*1000}))
+    # background watcher
+    def watcher():
+        time.sleep(req.minutes*60)
+        if LEAVE_TIMER.get(req.deskId) == deadline:
+            mqttc.publish(f"minddesk/{req.deskId}/incident", json.dumps({"type":"overstay","ts":int(time.time()*1000)}))
+    threading.Thread(target=watcher, daemon=True).start()
+    return {"ok": True, "deadline": deadline}
