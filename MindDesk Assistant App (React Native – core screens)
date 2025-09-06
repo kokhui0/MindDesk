@@ -1,35 +1,1008 @@
-import React, {useState} from "react";
-import { SafeAreaView, View, Text } from "react-native";
-import { Button, TextInput } from "react-native-paper";
-import axios from "axios";
+import React, { useState, useEffect } from 'react';
+import {
+  SafeAreaView,
+  ScrollView,
+  View,
+  Text,
+  StyleSheet,
+  Alert,
+  RefreshControl,
+  TouchableOpacity,
+  StatusBar,
+  Platform,
+} from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import Icon from 'react-native-vector-icons/MaterialIcons';
 
-const API = "http://10.0.0.50:8000";
+// API Configuration
+const API_BASE_URL = 'http://10.0.0.50:8000'; // Backend server IP
 
-export default function App() {
-  const [userId, setUserId] = useState("u123");
-  const [deskId, setDeskId] = useState("D-101");
-  const [status, setStatus] = useState("");
+// Type Definitions
+interface Desk {
+  desk_id: string;
+  location: string;
+  floor: number;
+  features: string[];
+  status: 'available' | 'occupied' | 'reserved';
+  current_user?: string;
+  session_duration: number;
+  last_seen?: string;
+  signal_strength: number;
+}
 
-  const reserve = async () => {
-    await axios.post(`${API}/reserve`, {deskId, userId, minutes: 120});
-    setStatus("Reserved!");
-  };
-  const leave = async () => {
-    const r = await axios.post(`${API}/leave`, {deskId, minutes: 10});
-    setStatus("Leave window started. Deadline: "+ new Date(r.data.deadline).toLocaleTimeString());
+interface User {
+  student_id: string;
+  token: string;
+}
+
+interface DeskStatus {
+  desk_id: string;
+  occupied: boolean;
+  reserved: boolean;
+  current_user?: string;
+  session_duration: number;
+  leave_deadline?: string;
+  posture_alerts: number;
+  total_incidents: number;
+}
+
+// API Functions
+class MindDeskAPI {
+  static async login(studentId: string, password: string): Promise<User> {
+    const response = await fetch(`${API_BASE_URL}/auth/login`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        student_id: studentId,
+        password: password,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error('Invalid credentials');
+    }
+
+    return response.json();
+  }
+
+  static async getAvailableDesks(): Promise<{ desks: Desk[] }> {
+    const response = await fetch(`${API_BASE_URL}/desks/available`);
+    
+    if (!response.ok) {
+      throw new Error('Failed to fetch desks');
+    }
+
+    return response.json();
+  }
+
+  static async reserveDesk(deskId: string, userId: string, duration: number = 120) {
+    const response = await fetch(`${API_BASE_URL}/reserve`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        desk_id: deskId,
+        user_id: userId,
+        duration_minutes: duration,
+      }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.detail || 'Reservation failed');
+    }
+
+    return response.json();
+  }
+
+  static async checkIn(deskId: string, userId: string) {
+    const response = await fetch(`${API_BASE_URL}/checkin?desk_id=${deskId}&user_id=${userId}`, {
+      method: 'POST',
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.detail || 'Check-in failed');
+    }
+
+    return response.json();
+  }
+
+  static async requestLeave(deskId: string, userId: string, duration: number = 10) {
+    const response = await fetch(`${API_BASE_URL}/leave`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        desk_id: deskId,
+        user_id: userId,
+        leave_duration_minutes: duration,
+      }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.detail || 'Leave request failed');
+    }
+
+    return response.json();
+  }
+
+  static async checkOut(deskId: string, userId: string) {
+    const response = await fetch(`${API_BASE_URL}/checkout?desk_id=${deskId}&user_id=${userId}`, {
+      method: 'POST',
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.detail || 'Check-out failed');
+    }
+
+    return response.json();
+  }
+
+  static async getDeskStatus(deskId: string): Promise<DeskStatus> {
+    const response = await fetch(`${API_BASE_URL}/desk/${deskId}/status`);
+    
+    if (!response.ok) {
+      throw new Error('Failed to fetch desk status');
+    }
+
+    return response.json();
+  }
+}
+
+// Login Screen Component
+const LoginScreen: React.FC<{ onLogin: (user: User) => void }> = ({ onLogin }) => {
+  const [studentId, setStudentId] = useState('');
+  const [password, setPassword] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const handleLogin = async () => {
+    if (!studentId || !password) {
+      Alert.alert('Error', 'Please enter both student ID and password');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const user = await MindDeskAPI.login(studentId, password);
+      await AsyncStorage.setItem('minddesk_user', JSON.stringify(user));
+      onLogin(user);
+    } catch (error) {
+      Alert.alert('Login Failed', error.message);
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
-    <SafeAreaView style={{flex:1, padding:16}}>
-      <Text style={{fontSize:24, fontWeight:"600"}}>MindDesk</Text>
-      <TextInput label="User ID" value={userId} onChangeText={setUserId} />
-      <TextInput label="Desk ID" value={deskId} onChangeText={setDeskId} />
-      <View style={{height:12}} />
-      <Button mode="contained" onPress={reserve}>Reserve</Button>
-      <View style={{height:8}} />
-      <Button mode="contained" onPress={leave}>Leave</Button>
-      <View style={{height:16}} />
-      <Text>{status}</Text>
+    <SafeAreaView style={styles.container}>
+      <StatusBar backgroundColor="#1E88E5" barStyle="light-content" />
+      <View style={styles.loginContainer}>
+        <Icon name="school" size={80} color="#1E88E5" />
+        <Text style={styles.appTitle}>MindDesk</Text>
+        <Text style={styles.subtitle}>Smart Study Assistant</Text>
+
+        <View style={styles.inputContainer}>
+          <Icon name="person" size={24} color="#666" />
+          <TextInput
+            style={styles.textInput}
+            placeholder="Student ID"
+            value={studentId}
+            onChangeText={setStudentId}
+            autoCapitalize="none"
+            autoCorrect={false}
+          />
+        </View>
+
+        <View style={styles.inputContainer}>
+          <Icon name="lock" size={24} color="#666" />
+          <TextInput
+            style={styles.textInput}
+            placeholder="Password"
+            value={password}
+            onChangeText={setPassword}
+            secureTextEntry
+          />
+        </View>
+
+        <TouchableOpacity
+          style={[styles.button, { opacity: loading ? 0.7 : 1 }]}
+          onPress={handleLogin}
+          disabled={loading}
+        >
+          <Text style={styles.buttonText}>
+            {loading ? 'Logging in...' : 'Login'}
+          </Text>
+        </TouchableOpacity>
+      </View>
     </SafeAreaView>
   );
-}
+};
+
+// Desk Card Component
+const DeskCard: React.FC<{
+  desk: Desk;
+  onReserve: (deskId: string) => void;
+  onCheckIn: (deskId: string) => void;
+  currentUser?: string;
+}> = ({ desk, onReserve, onCheckIn, currentUser }) => {
+  const getStatusColor = () => {
+    switch (desk.status) {
+      case 'available': return '#4CAF50';
+      case 'occupied': return '#F44336';
+      case 'reserved': return '#FF9800';
+      default: return '#666';
+    }
+  };
+
+  const getStatusIcon = () => {
+    switch (desk.status) {
+      case 'available': return 'event-seat';
+      case 'occupied': return 'person';
+      case 'reserved': return 'access-time';
+      default: return 'help';
+    }
+  };
+
+  const isMyReservation = desk.status === 'reserved' && desk.current_user === currentUser;
+
+  return (
+    <View style={styles.deskCard}>
+      <View style={styles.deskHeader}>
+        <View>
+          <Text style={styles.deskId}>{desk.desk_id}</Text>
+          <Text style={styles.deskLocation}>{desk.location}</Text>
+        </View>
+        <View style={[styles.statusBadge, { backgroundColor: getStatusColor() }]}>
+          <Icon name={getStatusIcon()} size={16} color="white" />
+          <Text style={styles.statusText}>{desk.status.toUpperCase()}</Text>
+        </View>
+      </View>
+
+      <View style={styles.deskFeatures}>
+        {desk.features.map((feature, index) => (
+          <View key={index} style={styles.featureTag}>
+            <Text style={styles.featureText}>{feature}</Text>
+          </View>
+        ))}
+      </View>
+
+      <View style={styles.deskInfo}>
+        <View style={styles.infoItem}>
+          <Icon name="wifi" size={16} color="#666" />
+          <Text style={styles.infoText}>
+            Signal: {desk.signal_strength > -50 ? 'Strong' : desk.signal_strength > -70 ? 'Good' : 'Weak'}
+          </Text>
+        </View>
+        {desk.session_duration > 0 && (
+          <View style={styles.infoItem}>
+            <Icon name="access-time" size={16} color="#666" />
+            <Text style={styles.infoText}>{desk.session_duration} min</Text>
+          </View>
+        )}
+      </View>
+
+      <View style={styles.deskActions}>
+        {desk.status === 'available' && (
+          <TouchableOpacity
+            style={[styles.actionButton, styles.reserveButton]}
+            onPress={() => onReserve(desk.desk_id)}
+          >
+            <Icon name="book-online" size={18} color="white" />
+            <Text style={styles.actionButtonText}>Reserve</Text>
+          </TouchableOpacity>
+        )}
+        
+        {isMyReservation && (
+          <TouchableOpacity
+            style={[styles.actionButton, styles.checkInButton]}
+            onPress={() => onCheckIn(desk.desk_id)}
+          >
+            <Icon name="login" size={18} color="white" />
+            <Text style={styles.actionButtonText}>Check In</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+    </View>
+  );
+};
+
+// Current Session Component
+const CurrentSession: React.FC<{
+  deskStatus: DeskStatus;
+  onLeave: () => void;
+  onCheckOut: () => void;
+}> = ({ deskStatus, onLeave, onCheckOut }) => {
+  const formatDuration = (minutes: number) => {
+    const hours = Math.floor(minutes / 60);
+    const mins = minutes % 60;
+    return hours > 0 ? `${hours}h ${mins}m` : `${mins}m`;
+  };
+
+  return (
+    <View style={styles.sessionCard}>
+      <View style={styles.sessionHeader}>
+        <Icon name="desktop-mac" size={32} color="#1E88E5" />
+        <View>
+          <Text style={styles.sessionTitle}>Current Session</Text>
+          <Text style={styles.sessionDesk}>{deskStatus.desk_id}</Text>
+        </View>
+      </View>
+
+      <View style={styles.sessionStats}>
+        <View style={styles.statItem}>
+          <Text style={styles.statValue}>{formatDuration(deskStatus.session_duration)}</Text>
+          <Text style={styles.statLabel}>Session Time</Text>
+        </View>
+        <View style={styles.statItem}>
+          <Text style={styles.statValue}>{deskStatus.posture_alerts}</Text>
+          <Text style={styles.statLabel}>Posture Alerts</Text>
+        </View>
+        <View style={styles.statItem}>
+          <Text style={styles.statValue}>{deskStatus.total_incidents}</Text>
+          <Text style={styles.statLabel}>Incidents</Text>
+        </View>
+      </View>
+
+      {deskStatus.leave_deadline && (
+        <View style={styles.leaveAlert}>
+          <Icon name="warning" size={20} color="#FF9800" />
+          <Text style={styles.leaveText}>
+            Return by {new Date(deskStatus.leave_deadline).toLocaleTimeString()}
+          </Text>
+        </View>
+      )}
+
+      <View style={styles.sessionActions}>
+        <TouchableOpacity
+          style={[styles.actionButton, styles.leaveButton]}
+          onPress={onLeave}
+          disabled={!!deskStatus.leave_deadline}
+        >
+          <Icon name="exit-to-app" size={18} color="white" />
+          <Text style={styles.actionButtonText}>Leave (10 min)</Text>
+        </TouchableOpacity>
+        
+        <TouchableOpacity
+          style={[styles.actionButton, styles.checkOutButton]}
+          onPress={onCheckOut}
+        >
+          <Icon name="logout" size={18} color="white" />
+          <Text style={styles.actionButtonText}>Check Out</Text>
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+};
+
+// Main App Component
+const App: React.FC = () => {
+  const [user, setUser] = useState<User | null>(null);
+  const [desks, setDesks] = useState<Desk[]>([]);
+  const [currentSession, setCurrentSession] = useState<DeskStatus | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+
+  useEffect(() => {
+    initializeApp();
+  }, []);
+
+  const initializeApp = async () => {
+    try {
+      const savedUser = await AsyncStorage.getItem('minddesk_user');
+      if (savedUser) {
+        const userData = JSON.parse(savedUser);
+        setUser(userData);
+        await loadDesksAndSession(userData);
+      }
+    } catch (error) {
+      console.error('Initialization error:', error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const loadDesksAndSession = async (userData: User) => {
+    try {
+      const [desksData] = await Promise.all([
+        MindDeskAPI.getAvailableDesks(),
+        loadCurrentSession(userData.student_id)
+      ]);
+      setDesks(desksData.desks);
+    } catch (error) {
+      console.error('Failed to load data:', error);
+      Alert.alert('Error', 'Failed to load desk information');
+    }
+  };
+
+  const loadCurrentSession = async (userId: string) => {
+    try {
+      // Check all desks for current user session
+      const desksData = await MindDeskAPI.getAvailableDesks();
+      const myDesk = desksData.desks.find(desk => 
+        desk.status === 'occupied' && desk.current_user === userId
+      );
+      
+      if (myDesk) {
+        const deskStatus = await MindDeskAPI.getDeskStatus(myDesk.desk_id);
+        setCurrentSession(deskStatus);
+      } else {
+        setCurrentSession(null);
+      }
+    } catch (error) {
+      console.error('Failed to load session:', error);
+    }
+  };
+
+  const handleRefresh = async () => {
+    if (!user) return;
+    
+    setRefreshing(true);
+    try {
+      await loadDesksAndSession(user);
+    } catch (error) {
+      Alert.alert('Error', 'Failed to refresh data');
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  const handleLogin = (userData: User) => {
+    setUser(userData);
+    loadDesksAndSession(userData);
+  };
+
+  const handleLogout = async () => {
+    Alert.alert(
+      'Logout',
+      'Are you sure you want to logout?',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Logout',
+          onPress: async () => {
+            await AsyncStorage.removeItem('minddesk_user');
+            setUser(null);
+            setDesks([]);
+            setCurrentSession(null);
+          }
+        }
+      ]
+    );
+  };
+
+  const handleReserveDesk = async (deskId: string) => {
+    if (!user) return;
+
+    Alert.alert(
+      'Reserve Desk',
+      `Reserve desk ${deskId}?`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Reserve for 2 hours',
+          onPress: async () => {
+            try {
+              await MindDeskAPI.reserveDesk(deskId, user.student_id, 120);
+              Alert.alert('Success', `Desk ${deskId} reserved for 2 hours`);
+              handleRefresh();
+            } catch (error) {
+              Alert.alert('Reservation Failed', error.message);
+            }
+          }
+        }
+      ]
+    );
+  };
+
+  const handleCheckIn = async (deskId: string) => {
+    if (!user) return;
+
+    try {
+      await MindDeskAPI.checkIn(deskId, user.student_id);
+      Alert.alert('Success', `Checked into desk ${deskId}`);
+      handleRefresh();
+    } catch (error) {
+      Alert.alert('Check-in Failed', error.message);
+    }
+  };
+
+  const handleLeaveRequest = async () => {
+    if (!user || !currentSession) return;
+
+    Alert.alert(
+      'Request Leave',
+      'Request 10-minute leave from your desk?',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Request Leave',
+          onPress: async () => {
+            try {
+              await MindDeskAPI.requestLeave(currentSession.desk_id, user.student_id, 10);
+              Alert.alert('Leave Granted', 'You have 10 minutes to return');
+              handleRefresh();
+            } catch (error) {
+              Alert.alert('Leave Request Failed', error.message);
+            }
+          }
+        }
+      ]
+    );
+  };
+
+  const handleCheckOut = async () => {
+    if (!user || !currentSession) return;
+
+    Alert.alert(
+      'Check Out',
+      `Check out from desk ${currentSession.desk_id}?`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Check Out',
+          onPress: async () => {
+            try {
+              await MindDeskAPI.checkOut(currentSession.desk_id, user.student_id);
+              Alert.alert('Success', 'Checked out successfully');
+              setCurrentSession(null);
+              handleRefresh();
+            } catch (error) {
+              Alert.alert('Check-out Failed', error.message);
+            }
+          }
+        }
+      ]
+    );
+  };
+
+  if (loading) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.centerContent}>
+          <Icon name="school" size={60} color="#1E88E5" />
+          <Text style={styles.loadingText}>Loading MindDesk...</Text>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  if (!user) {
+    return <LoginScreen onLogin={handleLogin} />;
+  }
+
+  const availableDesks = desks.filter(desk => 
+    desk.status === 'available' || (desk.status === 'reserved' && desk.current_user === user.student_id)
+  );
+
+  return (
+    <SafeAreaView style={styles.container}>
+      <StatusBar backgroundColor="#1E88E5" barStyle="light-content" />
+      
+      {/* Header */}
+      <View style={styles.header}>
+        <View>
+          <Text style={styles.headerTitle}>MindDesk</Text>
+          <Text style={styles.headerSubtitle}>Welcome, {user.student_id}</Text>
+        </View>
+        <TouchableOpacity onPress={handleLogout} style={styles.logoutButton}>
+          <Icon name="logout" size={24} color="white" />
+        </TouchableOpacity>
+      </View>
+
+      <ScrollView
+        style={styles.content}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={handleRefresh} />
+        }
+      >
+        {/* Current Session */}
+        {currentSession && (
+          <View style={styles.section}>
+            <Text style={styles.sectionTitle}>Current Session</Text>
+            <CurrentSession
+              deskStatus={currentSession}
+              onLeave={handleLeaveRequest}
+              onCheckOut={handleCheckOut}
+            />
+          </View>
+        )}
+
+        {/* Available Desks */}
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>
+            Available Desks ({availableDesks.length})
+          </Text>
+          
+          {availableDesks.length === 0 ? (
+            <View style={styles.emptyState}>
+              <Icon name="event-busy" size={48} color="#666" />
+              <Text style={styles.emptyStateText}>No desks available</Text>
+              <Text style={styles.emptyStateSubtext}>
+                Check back later or try refreshing
+              </Text>
+            </View>
+          ) : (
+            availableDesks.map((desk) => (
+              <DeskCard
+                key={desk.desk_id}
+                desk={desk}
+                onReserve={handleReserveDesk}
+                onCheckIn={handleCheckIn}
+                currentUser={user.student_id}
+              />
+            ))
+          )}
+        </View>
+
+        {/* All Desks Overview */}
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Library Overview</Text>
+          <View style={styles.overviewGrid}>
+            <View style={styles.overviewCard}>
+              <Text style={styles.overviewNumber}>
+                {desks.filter(d => d.status === 'available').length}
+              </Text>
+              <Text style={styles.overviewLabel}>Available</Text>
+            </View>
+            <View style={styles.overviewCard}>
+              <Text style={styles.overviewNumber}>
+                {desks.filter(d => d.status === 'occupied').length}
+              </Text>
+              <Text style={styles.overviewLabel}>Occupied</Text>
+            </View>
+            <View style={styles.overviewCard}>
+              <Text style={styles.overviewNumber}>
+                {desks.filter(d => d.status === 'reserved').length}
+              </Text>
+              <Text style={styles.overviewLabel}>Reserved</Text>
+            </View>
+          </View>
+        </View>
+      </ScrollView>
+    </SafeAreaView>
+  );
+};
+
+// Import TextInput from react-native
+import { TextInput } from 'react-native';
+
+// Styles
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: '#f5f5f5',
+  },
+  centerContent: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  loadingText: {
+    fontSize: 18,
+    color: '#666',
+    marginTop: 16,
+  },
+  
+  // Login Screen Styles
+  loginContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 32,
+    backgroundColor: 'white',
+  },
+  appTitle: {
+    fontSize: 32,
+    fontWeight: 'bold',
+    color: '#1E88E5',
+    marginTop: 16,
+  },
+  subtitle: {
+    fontSize: 16,
+    color: '#666',
+    marginBottom: 48,
+  },
+  inputContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#ddd',
+    borderRadius: 8,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    marginBottom: 16,
+    backgroundColor: '#f9f9f9',
+    width: '100%',
+  },
+  textInput: {
+    flex: 1,
+    fontSize: 16,
+    marginLeft: 12,
+    color: '#333',
+  },
+  button: {
+    backgroundColor: '#1E88E5',
+    paddingVertical: 16,
+    paddingHorizontal: 32,
+    borderRadius: 8,
+    width: '100%',
+    alignItems: 'center',
+    marginTop: 16,
+  },
+  buttonText: {
+    color: 'white',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  
+  // Header Styles
+  header: {
+    backgroundColor: '#1E88E5',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 20,
+    paddingVertical: 16,
+    ...Platform.select({
+      ios: {
+        paddingTop: 60,
+      },
+      android: {
+        paddingTop: 20,
+      },
+    }),
+  },
+  headerTitle: {
+    color: 'white',
+    fontSize: 24,
+    fontWeight: 'bold',
+  },
+  headerSubtitle: {
+    color: 'rgba(255, 255, 255, 0.8)',
+    fontSize: 14,
+  },
+  logoutButton: {
+    padding: 8,
+  },
+  
+  // Content Styles
+  content: {
+    flex: 1,
+  },
+  section: {
+    margin: 16,
+  },
+  sectionTitle: {
+    fontSize: 20,
+    fontWeight: '600',
+    color: '#333',
+    marginBottom: 12,
+  },
+  
+  // Desk Card Styles
+  deskCard: {
+    backgroundColor: 'white',
+    borderRadius: 12,
+    padding: 16,
+    marginBottom: 12,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  deskHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    marginBottom: 12,
+  },
+  deskId: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#333',
+  },
+  deskLocation: {
+    fontSize: 14,
+    color: '#666',
+    marginTop: 2,
+  },
+  statusBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 16,
+  },
+  statusText: {
+    color: 'white',
+    fontSize: 12,
+    fontWeight: '600',
+    marginLeft: 4,
+  },
+  deskFeatures: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    marginBottom: 12,
+  },
+  featureTag: {
+    backgroundColor: '#E3F2FD',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 12,
+    marginRight: 8,
+    marginBottom: 4,
+  },
+  featureText: {
+    fontSize: 12,
+    color: '#1E88E5',
+    fontWeight: '500',
+  },
+  deskInfo: {
+    flexDirection: 'row',
+    marginBottom: 12,
+  },
+  infoItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginRight: 16,
+  },
+  infoText: {
+    fontSize: 12,
+    color: '#666',
+    marginLeft: 4,
+  },
+  deskActions: {
+    flexDirection: 'row',
+  },
+  actionButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 6,
+    marginRight: 8,
+  },
+  actionButtonText: {
+    color: 'white',
+    fontSize: 14,
+    fontWeight: '600',
+    marginLeft: 6,
+  },
+  reserveButton: {
+    backgroundColor: '#4CAF50',
+  },
+  checkInButton: {
+    backgroundColor: '#1E88E5',
+  },
+  leaveButton: {
+    backgroundColor: '#FF9800',
+  },
+  checkOutButton: {
+    backgroundColor: '#F44336',
+  },
+  
+  // Session Card Styles
+  sessionCard: {
+    backgroundColor: 'white',
+    borderRadius: 12,
+    padding: 20,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  sessionHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 16,
+  },
+  sessionTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#333',
+    marginLeft: 12,
+  },
+  sessionDesk: {
+    fontSize: 14,
+    color: '#666',
+    marginLeft: 12,
+  },
+  sessionStats: {
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    marginBottom: 16,
+    paddingVertical: 16,
+    backgroundColor: '#f8f9fa',
+    borderRadius: 8,
+  },
+  statItem: {
+    alignItems: 'center',
+  },
+  statValue: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: '#1E88E5',
+  },
+  statLabel: {
+    fontSize: 12,
+    color: '#666',
+    marginTop: 4,
+  },
+  leaveAlert: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#FFF3E0',
+    padding: 12,
+    borderRadius: 8,
+    marginBottom: 16,
+  },
+  leaveText: {
+    fontSize: 14,
+    color: '#E65100',
+    marginLeft: 8,
+    fontWeight: '500',
+  },
+  sessionActions: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  
+  // Overview Styles
+  overviewGrid: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  overviewCard: {
+    backgroundColor: 'white',
+    borderRadius: 8,
+    padding: 16,
+    alignItems: 'center',
+    flex: 1,
+    marginHorizontal: 4,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.05,
+    shadowRadius: 2,
+    elevation: 2,
+  },
+  overviewNumber: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    color: '#1E88E5',
+  },
+  overviewLabel: {
+    fontSize: 12,
+    color: '#666',
+    marginTop: 4,
+  },
+  
+  // Empty State Styles
+  emptyState: {
+    alignItems: 'center',
+    padding: 40,
+    backgroundColor: 'white',
+    borderRadius: 12,
+  },
+  emptyStateText: {
+    fontSize: 16,
+    color: '#666',
+    marginTop: 12,
+    fontWeight: '500',
+  },
+  emptyStateSubtext: {
+    fontSize: 14,
+    color: '#999',
+    marginTop: 4,
+  },
+});
+
+export default App;
