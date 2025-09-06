@@ -1,0 +1,35 @@
+import React, {useState} from "react";
+import { SafeAreaView, View, Text } from "react-native";
+import { Button, TextInput } from "react-native-paper";
+import axios from "axios";
+
+const API = "http://10.0.0.50:8000";
+
+export default function App() {
+  const [userId, setUserId] = useState("u123");
+  const [deskId, setDeskId] = useState("D-101");
+  const [status, setStatus] = useState("");
+
+  const reserve = async () => {
+    await axios.post(`${API}/reserve`, {deskId, userId, minutes: 120});
+    setStatus("Reserved!");
+  };
+  const leave = async () => {
+    const r = await axios.post(`${API}/leave`, {deskId, minutes: 10});
+    setStatus("Leave window started. Deadline: "+ new Date(r.data.deadline).toLocaleTimeString());
+  };
+
+  return (
+    <SafeAreaView style={{flex:1, padding:16}}>
+      <Text style={{fontSize:24, fontWeight:"600"}}>MindDesk</Text>
+      <TextInput label="User ID" value={userId} onChangeText={setUserId} />
+      <TextInput label="Desk ID" value={deskId} onChangeText={setDeskId} />
+      <View style={{height:12}} />
+      <Button mode="contained" onPress={reserve}>Reserve</Button>
+      <View style={{height:8}} />
+      <Button mode="contained" onPress={leave}>Leave</Button>
+      <View style={{height:16}} />
+      <Text>{status}</Text>
+    </SafeAreaView>
+  );
+}
