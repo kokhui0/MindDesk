@@ -1,0 +1,155 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <LiquidCrystal_I2C.h>
+#include <FastLED.h>
+
+#define DESK_ID        "D-101"
+#define WIFI_SSID      "CampusWiFi"
+#define WIFI_PASS      "password"
+#define MQTT_HOST      "10.0.0.50"
+#define MQTT_PORT      1883
+
+// RFID (SPI)
+#define SS_PIN   5
+#define RST_PIN  4
+MFRC522 rfid(SS_PIN, RST_PIN);
+
+// IMU
+Adafruit_MPU6050 mpu;
+
+// LCD (I2C 0x27)
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// LED strip
+#define LED_PIN 27
+#define NUM_LEDS 20
+CRGB leds[NUM_LEDS];
+
+// Buzzer / vib
+#define BUZZ_PIN 26
+#define VIB_PIN  25
+
+WiFiClient wifiClient;
+PubSubClient mqtt(wifiClient);
+
+bool occupied = false;
+unsigned long lastPublish = 0;
+unsigned long leaveDeadline = 0;  // millis() when leave window ends (0 = none)
+String currentUser = "";
+
+void setLED(String color) {
+  fill_solid(leds, NUM_LEDS, (color=="red")?CRGB::Red:(color=="amber")?CRGB::Orange:CRGB::Black);
+  FastLED.show();
+}
+
+void buzz(int ms) {
+  ledcAttachPin(BUZZ_PIN, 0);
+  ledcWriteTone(0, 1800);
+  delay(ms);
+  ledcWriteTone(0, 0);
+}
+
+void vibrate(int ms){
+  pinMode(VIB_PIN, OUTPUT);
+  digitalWrite(VIB_PIN, HIGH);
+  delay(ms);
+  digitalWrite(VIB_PIN, LOW);
+}
+
+void showLCD(const String& l1, const String& l2="") {
+  lcd.clear(); lcd.setCursor(0,0); lcd.print(l1); lcd.setCursor(0,1); lcd.print(l2);
+}
+
+void ensureWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); }
+}
+
+void onMsg(char* topic, byte* payload, unsigned int len) {
+  String t = String(topic);
+  String msg = "";
+  for (uint i=0;i<len;i++) msg += (char)payload[i];
+
+  if (t.endsWith("/event/posture")) {
+    if (msg.indexOf("slouch")>=0) { setLED("amber"); vibrate(500); }
+    else if (msg.indexOf("sleep")>=0){ setLED("red"); buzz(800); vibrate(800); }
+    else { setLED("off"); }
+  } else if (t.endsWith("/leave_pending")) {
+    // payload like {"deadline": 600000}
+    int pos = msg.indexOf(":");
+    int ms = msg.substring(pos+1).toInt();
+    leaveDeadline = millis() + ms;
+    showLCD("Leave in 10 min", "Timer started");
+  } else if (t.endsWith("/reserve")) {
+    setLED("amber"); showLCD("Reserved", msg);
+  } else if (t.endsWith("/command")) {
+    if (msg.indexOf("red")>=0) setLED("red");
+    else if (msg.indexOf("amber")>=0) setLED("amber");
+    else setLED("off");
+    if (msg.indexOf("buzz")>=0) buzz(400);
+  }
+}
+
+void ensureMQTT() {
+  while (!mqtt.connected()) {
+    mqtt.connect(DESK_ID);
+    mqtt.subscribe(("minddesk/"+String(DESK_ID)+"/#").c_str());
+  }
+}
+
+void publishStatus() {
+  sensors_event_t a,g,temp;
+  mpu.getEvent(&a,&g,&temp);
+  float tilt = atan2(a.acceleration.y, a.acceleration.z) * 57.2958; // deg
+
+  String payload = "{\"occupied\":"+String(occupied?"true":"false")+
+                   ",\"tilt\":"+String(tilt,1)+
+                   ",\"ts\":"+String(millis())+"}";
+  mqtt.publish(("minddesk/"+String(DESK_ID)+"/status").c_str(), payload.c_str());
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(BUZZ_PIN, OUTPUT); pinMode(VIB_PIN, OUTPUT);
+  FastLED.addLeds<NEOPIXEL, LED_PIN>(leds, NUM_LEDS); setLED("off");
+
+  lcd.init(); lcd.backlight(); showLCD("MindDesk", "Booting...");
+  SPI.begin(); rfid.PCD_Init();
+
+  Wire.begin(); mpu.begin();
+
+  ensureWiFi(); mqtt.setServer(MQTT_HOST, MQTT_PORT); mqtt.setCallback(onMsg);
+  ensureMQTT(); showLCD("Ready", "Scan card");
+}
+
+void loop() {
+  ensureWiFi(); ensureMQTT(); mqtt.loop();
+
+  // RFID check-in/out
+  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+    occupied = !occupied; // simple toggle for demo
+    currentUser = occupied ? "user" : "";
+    showLCD(occupied ? "Checked in" : "Checked out");
+    publishStatus();
+    delay(800);
+  }
+
+  // Leave window enforcement
+  if (leaveDeadline && millis() > leaveDeadline) {
+    mqtt.publish(("minddesk/"+String(DESK_ID)+"/incident").c_str(),
+                 "{\"type\":\"overstay\"}");
+    setLED("red"); buzz(800); vibrate(800);
+    leaveDeadline = 0;
+  }
+
+  // periodic telemetry
+  if (millis() - lastPublish > 5000) {
+    publishStatus(); lastPublish = millis();
+  }
+}
